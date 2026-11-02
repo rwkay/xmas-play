@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en-us">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
+    <!-- added to a phone's home screen, the game opens without the browser's bars (iPhone has no full screen for pages) -->
+    <meta name="apple-mobile-web-app-capable" content="yes"/>
+    <meta name="mobile-web-app-capable" content="yes"/>
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+    <meta name="apple-mobile-web-app-title" content="Lemmings"/>
+    <title>Lemmings</title>
+    <link rel="icon" href="data:,">
+    <style>
+      body { margin: 0; background: #000014; color: #d0d0d0; font: 16px sans-serif; }
+      main { position: absolute; left: 50%; top: 40%; transform: translate(-50%, -50%); width: min(320px, calc(100% - 32px)); text-align: center; }
+      h1 { font-size: 28px; color: #60e060; margin: 0 0 24px; }
+      input, button { font: inherit; padding: 8px 12px; border-radius: 4px; border: 1px solid #405080; }
+      input { width: 100%; box-sizing: border-box; background: #10183a; color: #fff; margin-bottom: 12px; }
+      button { background: #2a8a2a; color: #fff; border-color: #2a8a2a; cursor: pointer; width: 100%; }
+      #message { min-height: 24px; margin-top: 12px; color: #ff8080; }
+      form[hidden] { display: none; }
+    </style>
+  </head>
+  <body>
+    <!-- The published (GitHub Pages) build only: the game files are encrypted with a key derived from the password
+         (pages/deploy.js). This page checks the password, keeps the key in localStorage, and sw.js decrypts the files
+         as the game loads them. Local builds have no password. -->
+    <main>
+      <h1>Lemmings</h1>
+      <form id="form" hidden>
+        <input id="password" type="password" placeholder="Password" autocomplete="current-password" autofocus>
+        <button type="submit">Play</button>
+      </form>
+      <div id="message"></div>
+    </main>
+    <script>
+      // the key, kept in localStorage (iOS can leave IndexedDB hanging): the deployment's salt and the raw key
+      const STORAGE = 'xmas-pages-key';
+      const message = document.getElementById('message');
+      const form = document.getElementById('form');
+
+      function fromBase64(text) { return Uint8Array.from(atob(text), c => c.charCodeAt(0)); }
+      function toBase64(bytes) { return btoa(String.fromCharCode(...new Uint8Array(bytes))); }
+
+      function loadStored() {
+        try {
+          return JSON.parse(localStorage.getItem(STORAGE));
+        } catch (e) {
+          return null;
+        }
+      }
+
+      // the raw key opens this deployment if it decrypts its check token
+      async function opens(raw, lock) {
+        try {
+          const key = await crypto.subtle.importKey('raw', fromBase64(raw), 'AES-GCM', false, [ 'decrypt' ]);
+          const check = fromBase64(lock.check);
+          await crypto.subtle.decrypt({ name: 'AES-GCM', iv: check.slice(0, 12) }, key, check.slice(12));
+          return true;
+        } catch (e) {
+          return false;
+        }
+      }
+
+      async function deriveRaw(password, lock) {
+        const material = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveKey']);
+        const key = await crypto.subtle.deriveKey({ name: 'PBKDF2', hash: 'SHA-256', salt: fromBase64(lock.salt), iterations: lock.iterations },
+                                                  material, { name: 'AES-GCM', length: 256 }, true, ['decrypt']);
+        return toBase64(await crypto.subtle.exportKey('raw', key));
+      }
+
+      // hands the key to the service worker (it answers once it has it), then opens the game, which hands it over
+      // again whenever a restarted worker asks
+      async function play(raw) {
+        if (!navigator.serviceWorker.controller)
+          await new Promise(resolve => navigator.serviceWorker.addEventListener('controllerchange', resolve, { once: true }));
+        const channel = new MessageChannel();
+        const answered = new Promise(resolve => { channel.port1.onmessage = resolve; });
+        navigator.serviceWorker.controller.postMessage({ type: 'raw-key', raw }, [ channel.port2 ]);
+        await Promise.race([ answered, new Promise(resolve => setTimeout(resolve, 2000)) ]);
+        location.replace('game.html');
+      }
+
+      (async () => {
+        if (!('serviceWorker' in navigator) || !window.crypto || !crypto.subtle) {
+          message.textContent = 'This browser can’t open the game (it needs service workers and Web Crypto).';
+          return;
+        }
+        await navigator.serviceWorker.register('sw.js');
+        await navigator.serviceWorker.ready;
+        const lock = await (await fetch('lock.json', { cache: 'no-store' })).json();
+
+        // the password was given before (for this deployment): straight in
+        const stored = loadStored();
+        if (stored && (stored.salt === lock.salt) && stored.raw && await opens(stored.raw, lock)) {
+          await play(stored.raw);
+          return;
+        }
+
+        form.hidden = false;
+        document.getElementById('password').focus();
+        form.addEventListener('submit', async event => {
+          event.preventDefault();
+          message.textContent = '';
+          const raw = await deriveRaw(document.getElementById('password').value, lock);
+          if (!await opens(raw, lock)) {
+            message.textContent = 'Wrong password';
+            return;
+          }
+          try {
+            localStorage.setItem(STORAGE, JSON.stringify({ salt: lock.salt, raw }));
+          } catch (e) {
+            message.textContent = 'This browser won’t keep the password (private browsing?)';
+            return;
+          }
+          await play(raw);
+        });
+      })().catch(error => { message.textContent = 'Error: ' + error.message; });
+    </script>
+  </body>
+</html>
